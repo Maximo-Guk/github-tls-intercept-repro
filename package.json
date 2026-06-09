@@ -1,0 +1,19 @@
+{
+	"name": "gh-tls-repro",
+	"description": "Minimal repro: an HTTPS intercept proxy closing github-origin TLS without close_notify breaks GnuTLS-linked git (-110) while OpenSSL curl tolerates it.",
+	"dependencies": {
+		"@cloudflare/containers": "0.0.30",
+		"hono": "4.11.1"
+	},
+	"devDependencies": {
+		"typescript": "5.9.3",
+		"wrangler": "4.88.0"
+	},
+	"private": true,
+	"scripts": {
+		"cf-typegen": "wrangler types",
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev",
+		"start": "wrangler dev"
+	}
+}
