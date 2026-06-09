@@ -28,12 +28,16 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"math/big"
 	"net"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -149,12 +153,21 @@ func serveDirtyTLS(tc *tls.Conn) {
 	tc.NetConn().Close()
 }
 
-// plainProxy is the :8080 handler: a clean HTTP reverse proxy to github.com
-// with no downstream TLS. This is the working "fix" path.
+// plainProxy is the :8080 handler. It serves the landing page and probe
+// endpoints, and otherwise acts as a clean HTTP reverse proxy to github.com
+// with no downstream TLS (the working "fix" path).
 func plainProxy(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/" && r.URL.RawQuery == "" {
+	switch r.URL.Path {
+	case "/":
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(landingPage))
+		w.Write([]byte(renderLanding(runProbes())))
+		return
+	case "/probe":
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(runProbes())
+		return
+	case "/healthz":
+		w.Write([]byte("ok"))
 		return
 	}
 	status, header, body, err := fetchUpstream(r)
@@ -192,6 +205,16 @@ func selfSignedCert() tls.Certificate {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }
 
+// stdoutMu serializes structured JSON log lines so concurrent probe runs
+// (timer + on-demand HTTP) don't interleave bytes on stdout.
+var stdoutMu sync.Mutex
+
+func stdoutLine(s string) {
+	stdoutMu.Lock()
+	defer stdoutMu.Unlock()
+	fmt.Fprintln(os.Stdout, s)
+}
+
 func main() {
 	cert := selfSignedCert()
 
@@ -212,33 +235,77 @@ func main() {
 		}
 	}()
 
-	// :8080 — clean plain-HTTP proxy (demonstrates the fix) + landing page.
+	// Periodic self-test + egress probe so the GnuTLS -110 (and the
+	// interception verdict) show up in deployed logs without any request.
+	// The first run waits for the :8443 listener to come up.
+	go func() {
+		time.Sleep(3 * time.Second)
+		for {
+			runProbes()
+			time.Sleep(30 * time.Second)
+		}
+	}()
+
+	// :8080 — clean plain-HTTP proxy (demonstrates the fix) + landing/probe.
 	log.Println("plain HTTP proxy listening on :8080 -> https://github.com")
 	if err := http.ListenAndServe(":8080", http.HandlerFunc(plainProxy)); err != nil {
 		log.Fatal(err)
 	}
 }
 
-const landingPage = `<!DOCTYPE html>
+// renderLanding renders the landing page with live probe results embedded.
+func renderLanding(report ProbeReport) string {
+	pretty, _ := json.MarshalIndent(report, "", "  ")
+	st := report.SelfTest
+	ep := report.EgressProbe
+
+	selfVerdict := "did NOT reproduce the missing close_notify"
+	if st.Gnutls110 {
+		selfVerdict = "reproduced the bug: GnuTLS-linked git failed with -110 (missing close_notify)"
+	}
+	egressVerdict := "NOT intercepted (real CA, clean shutdown) — expected on a normal Cloudflare account"
+	if ep.Intercepted {
+		egressVerdict = "INTERCEPTED — served the Cloudflare TLS proxy-everything Intercept CA"
+	}
+
+	return `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>github TLS close_notify repro</title></head>
-<body style="font-family:system-ui;max-width:48rem;margin:3rem auto;line-height:1.5">
+<body style="font-family:system-ui;max-width:52rem;margin:3rem auto;line-height:1.5">
 <h1>GitHub TLS dirty-close repro</h1>
-<p>This container is a tiny intercepting reverse proxy for <code>github.com</code>.</p>
-<ul>
-  <li><b>:8443</b> — HTTPS. Relays GitHub's response then closes the raw TCP
-      socket <b>without</b> a TLS <code>close_notify</code>. GnuTLS-linked
-      <code>git</code> fails with
-      <code>GnuTLS recv error (-110): The TLS connection was non-properly terminated.</code></li>
-  <li><b>:8080</b> — plain HTTP (no downstream TLS). Clones succeed. This is the
-      <code>https-&gt;http</code> rewrite fix.</li>
-</ul>
-<pre># reproduces the bug (GnuTLS -110):
-git -c http.sslVerify=false clone https://localhost:8443/cloudflare/templates.git
+<p>A tiny intercepting reverse proxy for <code>github.com</code> plus two probes
+that make the bug observable in logs.</p>
 
-# demonstrates the fix (works):
-git clone http://localhost:8080/cloudflare/templates.git</pre>
-<p>See the README for full details.</p>
+<h2>A. Self-test (always reproduces, anywhere)</h2>
+<p>Probes this container's own <b>:8443</b> dirty-close listener — it relays a real
+GitHub response then closes the raw TCP socket <b>without</b> a TLS
+<code>close_notify</code>. A GnuTLS-linked <code>git</code> fails with
+<code>GnuTLS recv error (-110)</code> (the authoritative signal). Go's
+<code>crypto/tls</code> tolerates a complete-record dirty close as plain
+<code>io.EOF</code> — the same tolerance OpenSSL shows — so the Go-side
+<code>go_detects_dirty</code> flag only catches truncated closes; the git -110 is
+what proves the missing close_notify.</p>
+<p><b>Verdict:</b> ` + htmlEscape(selfVerdict) + `</p>
+
+<h2>B. Real-egress probe (diagnostic)</h2>
+<p>Dials the real <code>github.com:443</code> and reports the served leaf cert
+issuer. On a normal Cloudflare account the container's own egress bypasses the
+egress proxy, so this shows a real CA and a clean shutdown. Inside a Seal-style
+intercepted environment it shows the Intercept CA and a dirty close.</p>
+<p><b>Verdict:</b> ` + htmlEscape(egressVerdict) + ` (issuer: <code>` + htmlEscape(ep.CertIssuer) + `</code>)</p>
+
+<h2>Live probe result</h2>
+<pre>` + htmlEscape(string(pretty)) + `</pre>
+
+<p>Fetched from <code>/probe</code>; also written to stdout as structured JSON
+(visible via <code>wrangler tail</code> / dashboard observability) and re-run on a
+30s timer. See the README.</p>
 </body>
 </html>
 `
+}
+
+func htmlEscape(s string) string {
+	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&#39;")
+	return r.Replace(s)
+}
