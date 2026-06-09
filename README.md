@@ -1,5 +1,9 @@
 # gh-tls-repro — HTTPS intercept proxy dirty-close vs GnuTLS git
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Maximo-Guk/github-tls-intercept-repro)
+
+> Deploying spins up the demo container + landing page. It does **not** reproduce the `-110` failure over the public URL — Cloudflare's edge re-terminates TLS cleanly (see [Important notes](#important-notes)); the repro must hit the container's `:8443` directly.
+
 Minimal, self-contained reproduction of a real bug: an **HTTPS intercept proxy
 that closes the origin TLS connection without a `close_notify` alert** breaks
 `git clone https://github.com/...` when `git` is linked against **GnuTLS**,
